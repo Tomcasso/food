@@ -1,0 +1,288 @@
+
+import os
+from pathlib import Path
+from datetime import datetime
+import httplib2
+import socks
+
+import pandas as pd
+from dotenv import load_dotenv
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+
+# ==============================
+# 1. 基础配置
+# ==============================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# 加载 API Key
+load_dotenv(BASE_DIR / ".env")
+API_KEY = os.getenv("YOUTUBE_API_KEY")
+
+# 默认搜索关键词
+DEFAULT_KEYWORDS = [
+    "岭南饮食文化",
+    "粤菜文化",
+    "广府菜",
+    "客家菜",
+    "潮汕美食",
+    "Cantonese Cuisine",
+    "Lingnan Food Culture",
+    "Hakka Cuisine",
+    "Chaoshan Cuisine"
+]
+
+# Excel 文件保存目录
+OUTPUT_DIR = BASE_DIR / "output"
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+
+# ==============================
+# 2. 创建 YouTube API 服务
+# ==============================
+
+
+def create_youtube_service():
+    """通过本地 HTTP 代理连接 YouTube Data API"""
+
+    if not API_KEY:
+        raise ValueError(
+            "没有找到 API Key，请检查项目目录下的 .env 文件！"
+        )
+
+    # 配置 HTTP 代理
+    proxy_info = httplib2.ProxyInfo(
+        proxy_type=socks.PROXY_TYPE_HTTP,
+        proxy_host="127.0.0.1",
+        proxy_port=7897
+    )
+
+    # 创建 HTTP 客户端
+    http = httplib2.Http(
+        proxy_info=proxy_info,
+        timeout=30
+    )
+
+    # 创建 YouTube API 服务
+    youtube = build(
+        "youtube",
+        "v3",
+        developerKey=API_KEY,
+        http=http,
+        cache_discovery=False
+    )
+
+    return youtube
+
+
+
+
+# ==============================
+# 3. 搜索 YouTube 视频
+# ==============================
+
+def search_videos(youtube, keyword, max_results=20):
+    """根据关键词搜索 YouTube 视频"""
+
+    print(f"\n正在搜索：{keyword}")
+
+    try:
+        request = youtube.search().list(
+            part="snippet",
+            q=keyword,
+            type="video",
+            maxResults=max_results,
+            order="relevance"
+        )
+
+        response = request.execute()
+
+        videos = []
+
+        for item in response.get("items", []):
+
+            video_id = item["id"]["videoId"]
+            snippet = item["snippet"]
+
+            # 获取视频封面
+            thumbnails = snippet.get("thumbnails", {})
+
+            thumbnail_url = (
+                thumbnails.get("high", {}).get("url")
+                or thumbnails.get("medium", {}).get("url")
+                or thumbnails.get("default", {}).get("url")
+                or ""
+            )
+
+            video = {
+                "video_id": video_id,
+                "视频标题": snippet.get("title", ""),
+                "视频简介": snippet.get("description", ""),
+                "频道名称": snippet.get("channelTitle", ""),
+                "发布时间": snippet.get("publishedAt", ""),
+                "视频链接": f"https://www.youtube.com/watch?v={video_id}",
+                "视频封面": thumbnail_url,
+                "检索关键词": keyword
+            }
+
+            videos.append(video)
+
+        print(f"成功获取 {len(videos)} 个视频")
+
+        return videos
+
+    except HttpError as e:
+        print(f"搜索失败：{keyword}")
+        print(f"API 错误：{e}")
+        return []
+
+    except Exception as e:
+        print(f"发生错误：{e}")
+        return []
+
+
+# ==============================
+# 4. 多关键词采集与去重
+# ==============================
+
+def crawl_all_videos(youtube, keywords, max_results=20):
+
+    all_videos = {}
+
+    for keyword in keywords:
+
+        videos = search_videos(
+            youtube,
+            keyword,
+            max_results
+        )
+
+        for video in videos:
+
+            video_id = video["video_id"]
+
+            if video_id in all_videos:
+
+                # 如果视频已经存在，合并检索关键词
+                old_keywords = all_videos[video_id]["检索关键词"]
+
+                if keyword not in old_keywords:
+                    all_videos[video_id]["检索关键词"] += f"；{keyword}"
+
+            else:
+                all_videos[video_id] = video
+
+    return list(all_videos.values())
+
+
+# ==============================
+# 5. 导出 Excel
+# ==============================
+
+def export_to_excel(videos):
+
+    if not videos:
+        print("\n没有采集到视频，暂不生成 Excel。")
+        return
+
+    df = pd.DataFrame(videos)
+
+    # 删除内部使用的视频 ID 列
+    df = df.drop(columns=["video_id"])
+
+    # 调整列顺序
+    columns = [
+        "视频标题",
+        "频道名称",
+        "发布时间",
+        "视频简介",
+        "检索关键词",
+        "视频链接",
+        "视频封面"
+    ]
+
+    df = df[columns]
+
+    # 生成文件名
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    file_path = OUTPUT_DIR / f"Lingnan_YouTube_{timestamp}.xlsx"
+
+    df.to_excel(file_path, index=False)
+
+    print("\n" + "=" * 45)
+    print("视频采集完成！")
+    print(f"共采集到：{len(videos)} 个不重复视频")
+    print(f"Excel 文件已保存至：{file_path}")
+    print("=" * 45)
+
+
+# ==============================
+# 6. 主程序
+# ==============================
+
+def main():
+
+    print("=" * 45)
+    print("       岭南饮食文化 YouTube 视频采集系统")
+    print("=" * 45)
+
+    # 输入关键词
+    print("\n默认关键词：")
+    print("、".join(DEFAULT_KEYWORDS))
+
+    user_input = input(
+        "\n请输入搜索关键词（多个关键词用英文逗号分隔，直接回车使用默认关键词）："
+    ).strip()
+
+    if user_input:
+        keywords = [
+            word.strip()
+            for word in user_input.split(",")
+            if word.strip()
+        ]
+    else:
+        keywords = DEFAULT_KEYWORDS
+
+    # 输入每个关键词采集数量
+    number_input = input(
+        "\n请输入每个关键词采集的视频数量（默认20，最多50）："
+    ).strip()
+
+    try:
+        max_results = int(number_input) if number_input else 20
+
+        if not 1 <= max_results <= 50:
+            raise ValueError
+
+    except ValueError:
+        print("输入不合法，使用默认数量20。")
+        max_results = 20
+
+    print(f"\n搜索关键词数量：{len(keywords)}")
+    print(f"每个关键词最多采集：{max_results} 个视频")
+
+    try:
+        youtube = create_youtube_service()
+
+        # 开始采集
+        videos = crawl_all_videos(
+            youtube,
+            keywords,
+            max_results
+        )
+
+        # 导出 Excel
+        export_to_excel(videos)
+
+    except ValueError as e:
+        print(f"\n配置错误：{e}")
+
+    except Exception as e:
+        print(f"\n程序运行失败：{e}")
+
+
+if __name__ == "__main__":
+    main()
